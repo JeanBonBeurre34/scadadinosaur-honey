@@ -16,7 +16,7 @@ logger = logging.getLogger("MODBUS")
 
 
 # ======================================================================
-# 1. TCP WRAPPER (PORT 502 → INTERNAL 1502) WITH STRICT SIEMENS FILTER
+# 1. TCP WRAPPER (PORT 502 → INTERNAL 1502) WITH FULL PACKET LOGGING
 # ======================================================================
 def tcp_logger_and_forward():
     source_port = 502
@@ -49,12 +49,14 @@ def pipe_sockets(source_sock, dest_host, dest_port):
         source_sock.close()
         return
 
+    # thread: inbound traffic → internal server
     threading.Thread(
         target=relay_with_unit_filter,
         args=(source_sock, dst),
         daemon=True
     ).start()
 
+    # thread: responses from internal server → attacker
     threading.Thread(
         target=relay_raw,
         args=(dst, source_sock),
@@ -63,7 +65,7 @@ def pipe_sockets(source_sock, dest_host, dest_port):
 
 
 def relay_raw(src, dst):
-    """Raw relay for Modbus responses from internal server → client."""
+    """Raw relay for outbound (server → attacker)."""
     try:
         while True:
             data = src.recv(4096)
@@ -77,13 +79,11 @@ def relay_raw(src, dst):
         dst.close()
 
 
+# ======================================================================
+# FULL PACKET LOGGER + SIEMENS UNITID FILTERING
+# ======================================================================
 def relay_with_unit_filter(src, dst):
-    """
-    STRICT SIEMENS behavior:
-      ✔ Allow UnitID = 1
-      ✔ Allow UnitID = 255 ONLY when FC = 0x2B (MEI Device Identification)
-      ✘ Drop all other UnitIDs
-    """
+    """Logs every inbound Modbus ADU and enforces Siemens UnitID rules."""
     try:
         while True:
             adu = src.recv(4096)
@@ -91,29 +91,47 @@ def relay_with_unit_filter(src, dst):
                 break
 
             if len(adu) < 8:
-                continue  # invalid ADU
+                logger.warning(f"[BAD] Short ADU ({len(adu)} bytes)")
+                continue
 
+            # Parse ADU header
+            transaction_id = int.from_bytes(adu[0:2], "big")
+            protocol_id = int.from_bytes(adu[2:4], "big")
+            length = int.from_bytes(adu[4:6], "big")
             unit_id = adu[6]
             function_code = adu[7]
-            adu_len = len(adu)
 
-            logger.info(f"[REQ] UnitID={unit_id} FC=0x{function_code:02x} LEN={adu_len}")
+            # Log the raw packet
+            logger.info(
+                f"[MODBUS RAW] TX={transaction_id} "
+                f"PID={protocol_id} LEN={length} "
+                f"UnitID={unit_id} FC=0x{function_code:02x} "
+                f"RAW={adu.hex()}"
+            )
 
-            # Siemens S7 exception: allow MEI device identification
-            if unit_id == 255 and function_code == 0x2B:
-                dst.sendall(adu)
+            # ---------------------------------------------------------
+            # 1. Siemens behavior: allow UnitID=255 only for MEI (0x2B)
+            # ---------------------------------------------------------
+            if unit_id == 255:
+                if function_code == 0x2B:
+                    logger.info("[ALLOW] UnitID=255 MEI device identification request")
+                    dst.sendall(adu)
+                else:
+                    logger.warning(f"[DROP] UnitID 255 illegal FC=0x{function_code:02x}")
                 continue
 
-            # Only UnitID 1 is valid
+            # ---------------------------------------------------------
+            # 2. Siemens PLCs normally respond ONLY to UnitID=1
+            # ---------------------------------------------------------
             if unit_id != 1:
-                logger.warning(f"[DROP] UnitID {unit_id} ignored (Siemens strict mode)")
+                logger.warning(f"[DROP] UnitID {unit_id} ignored (Siemens behavior)")
                 continue
 
-            # Pass to internal server
+            # Valid → forward to internal Modbus server
             dst.sendall(adu)
 
     except Exception as e:
-        logger.error(f"relay error: {e}")
+        logger.error(f"[relay_with_unit_filter] {e}")
 
     finally:
         src.close()
@@ -126,16 +144,13 @@ def relay_with_unit_filter(src, dst):
 async def start_modbus_server_async():
     logger.info("Initializing Modbus datastore...")
 
-    # 200 holding registers
     store = ModbusSlaveContext(
         hr=ModbusSequentialDataBlock(0, [0] * 200),
         zero_mode=True,
     )
 
-    # Ignore UnitID internally (wrapper enforces)
     context = ModbusServerContext(slaves=store, single=True)
 
-    # Banner grabbing (Device ID)
     identity = ModbusDeviceIdentification()
     identity.VendorName = "SIEMENS AG"
     identity.ProductCode = "6ES7"
@@ -143,7 +158,7 @@ async def start_modbus_server_async():
     identity.ModelName = "S7-1200"
     identity.MajorMinorRevision = "4.2"
 
-    # Sync DB simulation values to Modbus registers
+    # DB simulation → modbus registers
     from db_simulation import PLCDataBlocks
     db = PLCDataBlocks()
 
@@ -161,7 +176,6 @@ async def start_modbus_server_async():
 
     threading.Thread(target=sync_db_to_modbus, daemon=True).start()
 
-    # Create real Modbus TCP server on port 1502
     server = ModbusTcpServer(
         context=context,
         identity=identity,
@@ -170,7 +184,6 @@ async def start_modbus_server_async():
 
     logger.info("[+] Internal Pymodbus running on 1502")
 
-    # Start wrapper on port 502
     threading.Thread(target=tcp_logger_and_forward, daemon=True).start()
 
     await server.serve_forever()
