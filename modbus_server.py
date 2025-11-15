@@ -49,14 +49,14 @@ def pipe_sockets(source_sock, dest_host, dest_port):
         source_sock.close()
         return
 
-    # thread: inbound traffic → internal server
+    # inbound → server (log + filter)
     threading.Thread(
         target=relay_with_unit_filter,
         args=(source_sock, dst),
         daemon=True
     ).start()
 
-    # thread: responses from internal server → attacker
+    # outbound → attacker (log responses)
     threading.Thread(
         target=relay_raw,
         args=(dst, source_sock),
@@ -64,74 +64,86 @@ def pipe_sockets(source_sock, dest_host, dest_port):
     ).start()
 
 
-def relay_raw(src, dst):
-    """Raw relay for outbound (server → attacker)."""
-    try:
-        while True:
-            data = src.recv(4096)
-            if not data:
-                break
-            dst.sendall(data)
-    except:
-        pass
-    finally:
-        src.close()
-        dst.close()
-
-
 # ======================================================================
-# FULL PACKET LOGGER + SIEMENS UNITID FILTERING
+# REQUEST LOGGING + UNIT FILTER (attacker → server)
 # ======================================================================
 def relay_with_unit_filter(src, dst):
-    """Logs every inbound Modbus ADU and enforces Siemens UnitID rules."""
+    """Relay inbound requests, apply Siemens UnitID rules, and log raw packets."""
     try:
         while True:
             adu = src.recv(4096)
             if not adu:
                 break
 
+            # Minimal Modbus TCP ADU = 8 bytes
             if len(adu) < 8:
-                logger.warning(f"[BAD] Short ADU ({len(adu)} bytes)")
+                logger.info(f"[MODBUS RAW] SHORT RAW={adu.hex()}")
                 continue
 
-            # Parse ADU header
-            transaction_id = int.from_bytes(adu[0:2], "big")
-            protocol_id = int.from_bytes(adu[2:4], "big")
+            txid = int.from_bytes(adu[0:2], "big")
+            pid = int.from_bytes(adu[2:4], "big")
             length = int.from_bytes(adu[4:6], "big")
-            unit_id = adu[6]
-            function_code = adu[7]
+            unit = adu[6]
+            fc = adu[7]
 
-            # Log the raw packet
             logger.info(
-                f"[MODBUS RAW] TX={transaction_id} "
-                f"PID={protocol_id} LEN={length} "
-                f"UnitID={unit_id} FC=0x{function_code:02x} "
-                f"RAW={adu.hex()}"
+                f"[MODBUS RAW] TX={txid} PID={pid} LEN={length} "
+                f"UnitID={unit} FC=0x{fc:02x} RAW={adu.hex()}"
             )
 
-            # ---------------------------------------------------------
-            # 1. Siemens behavior: allow UnitID=255 only for MEI (0x2B)
-            # ---------------------------------------------------------
-            if unit_id == 255:
-                if function_code == 0x2B:
-                    logger.info("[ALLOW] UnitID=255 MEI device identification request")
-                    dst.sendall(adu)
-                else:
-                    logger.warning(f"[DROP] UnitID 255 illegal FC=0x{function_code:02x}")
+            # Siemens rules:
+            # Allow MEI14 ID query (UnitID 255, FC 0x2B)
+            if unit == 255 and fc == 0x2B:
+                dst.sendall(adu)
                 continue
 
-            # ---------------------------------------------------------
-            # 2. Siemens PLCs normally respond ONLY to UnitID=1
-            # ---------------------------------------------------------
-            if unit_id != 1:
-                logger.warning(f"[DROP] UnitID {unit_id} ignored (Siemens behavior)")
+            # All other traffic allowed ONLY on UnitID=1
+            if unit != 1:
+                logger.warning(f"[DROP] UnitID {unit} ignored (Siemens behavior)")
                 continue
 
-            # Valid → forward to internal Modbus server
             dst.sendall(adu)
 
     except Exception as e:
         logger.error(f"[relay_with_unit_filter] {e}")
+
+    finally:
+        src.close()
+        dst.close()
+
+
+# ======================================================================
+# RESPONSE LOGGING (server → attacker)
+# ======================================================================
+def relay_raw(src, dst):
+    """
+    Raw relay for outbound (server → attacker).
+    Logs the response paired with the request above.
+    """
+    try:
+        while True:
+            data = src.recv(4096)
+            if not data:
+                break
+
+            if len(data) >= 8:
+                txid = int.from_bytes(data[0:2], "big")
+                pid = int.from_bytes(data[2:4], "big")
+                length = int.from_bytes(data[4:6], "big")
+                unit = data[6]
+                fc = data[7]
+
+                logger.info(
+                    f"[MODBUS RESP] TX={txid} PID={pid} LEN={length} "
+                    f"UnitID={unit} FC=0x{fc:02x} RAW={data.hex()}"
+                )
+            else:
+                logger.info(f"[MODBUS RESP] SHORT RAW={data.hex()}")
+
+            dst.sendall(data)
+
+    except Exception as e:
+        logger.error(f"[relay_raw] {e}")
 
     finally:
         src.close()
@@ -144,13 +156,16 @@ def relay_with_unit_filter(src, dst):
 async def start_modbus_server_async():
     logger.info("Initializing Modbus datastore...")
 
+    # 200 registers
     store = ModbusSlaveContext(
         hr=ModbusSequentialDataBlock(0, [0] * 200),
         zero_mode=True,
     )
 
+    # Wrapper enforces single UnitID → so use single=True
     context = ModbusServerContext(slaves=store, single=True)
 
+    # Device ID data
     identity = ModbusDeviceIdentification()
     identity.VendorName = "SIEMENS AG"
     identity.ProductCode = "6ES7"
@@ -158,7 +173,7 @@ async def start_modbus_server_async():
     identity.ModelName = "S7-1200"
     identity.MajorMinorRevision = "4.2"
 
-    # DB simulation → modbus registers
+    # DB simulation to holding registers
     from db_simulation import PLCDataBlocks
     db = PLCDataBlocks()
 
@@ -176,6 +191,7 @@ async def start_modbus_server_async():
 
     threading.Thread(target=sync_db_to_modbus, daemon=True).start()
 
+    # Internal server on localhost:1502
     server = ModbusTcpServer(
         context=context,
         identity=identity,
@@ -184,6 +200,7 @@ async def start_modbus_server_async():
 
     logger.info("[+] Internal Pymodbus running on 1502")
 
+    # Start wrapper before server loop
     threading.Thread(target=tcp_logger_and_forward, daemon=True).start()
 
     await server.serve_forever()
@@ -192,3 +209,4 @@ async def start_modbus_server_async():
 def start_modbus_server():
     asyncio.run(start_modbus_server_async())
 
+                                     
