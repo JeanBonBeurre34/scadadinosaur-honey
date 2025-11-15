@@ -8,7 +8,7 @@ def start_cpu_cycle(db):
 
     while True:
         db.cycle_update()
-        logger.info(f"[DB UPDATE] {db.dump()}")
+        #logger.info(f"[DB UPDATE] {db.dump()}")
         time.sleep(1.0)
 
                 
