@@ -16,7 +16,7 @@ logger = logging.getLogger("MODBUS")
 
 
 # ======================================================================
-# 1. TCP WRAPPER (PORT 502 → INTERNAL 1502) WITH UNITID FILTERING
+# 1. TCP WRAPPER (PORT 502 → INTERNAL 1502) WITH STRICT SIEMENS FILTER
 # ======================================================================
 def tcp_logger_and_forward():
     source_port = 502
@@ -63,7 +63,7 @@ def pipe_sockets(source_sock, dest_host, dest_port):
 
 
 def relay_raw(src, dst):
-    """Raw relay for responses from internal server."""
+    """Raw relay for Modbus responses from internal server → client."""
     try:
         while True:
             data = src.recv(4096)
@@ -78,36 +78,38 @@ def relay_raw(src, dst):
 
 
 def relay_with_unit_filter(src, dst):
-    """Relay but enforce Siemens UnitID behavior inbound."""
+    """
+    STRICT SIEMENS behavior:
+      ✔ Allow UnitID = 1
+      ✔ Allow UnitID = 255 ONLY when FC = 0x2B (MEI Device Identification)
+      ✘ Drop all other UnitIDs
+    """
     try:
         while True:
             adu = src.recv(4096)
             if not adu:
                 break
 
-            # Minimal ADU size = 8 bytes
             if len(adu) < 8:
-                continue
+                continue  # invalid ADU
 
             unit_id = adu[6]
             function_code = adu[7]
+            adu_len = len(adu)
 
-            # Siemens S7 behavior:
-            # ----------------------------------------------------
-            # 1. Allow UnitID 255 ONLY for MEI14 device identity
-            # ----------------------------------------------------
+            logger.info(f"[REQ] UnitID={unit_id} FC=0x{function_code:02x} LEN={adu_len}")
+
+            # Siemens S7 exception: allow MEI device identification
             if unit_id == 255 and function_code == 0x2B:
                 dst.sendall(adu)
                 continue
 
-            # ----------------------------------------------------
-            # 2. For EVERYTHING ELSE: ONLY UnitID 1 is valid
-            # ----------------------------------------------------
+            # Only UnitID 1 is valid
             if unit_id != 1:
-                logger.warning(f"[DROP] UnitID {unit_id} ignored (Siemens behavior)")
+                logger.warning(f"[DROP] UnitID {unit_id} ignored (Siemens strict mode)")
                 continue
 
-            # Pass valid traffic
+            # Pass to internal server
             dst.sendall(adu)
 
     except Exception as e:
@@ -124,16 +126,16 @@ def relay_with_unit_filter(src, dst):
 async def start_modbus_server_async():
     logger.info("Initializing Modbus datastore...")
 
-    # 200 registers
+    # 200 holding registers
     store = ModbusSlaveContext(
         hr=ModbusSequentialDataBlock(0, [0] * 200),
         zero_mode=True,
     )
 
-    # single=True = ignore UnitID in pymodbus (wrapper handles it)
+    # Ignore UnitID internally (wrapper enforces)
     context = ModbusServerContext(slaves=store, single=True)
 
-    # Device ID fields (banner grabbing)
+    # Banner grabbing (Device ID)
     identity = ModbusDeviceIdentification()
     identity.VendorName = "SIEMENS AG"
     identity.ProductCode = "6ES7"
@@ -141,7 +143,7 @@ async def start_modbus_server_async():
     identity.ModelName = "S7-1200"
     identity.MajorMinorRevision = "4.2"
 
-    # Sync DB simulation values into Modbus registers
+    # Sync DB simulation values to Modbus registers
     from db_simulation import PLCDataBlocks
     db = PLCDataBlocks()
 
@@ -155,12 +157,11 @@ async def start_modbus_server_async():
             store.setValues(3, 5,  [1 if db.DB1["Motor2_Running"] else 0])
             store.setValues(3, 100, [int(db.DB100["CPU_Load"])])
             store.setValues(3, 101, [int(db.DB100["Scan_Time"] * 10)])
-
             time.sleep(1)
 
     threading.Thread(target=sync_db_to_modbus, daemon=True).start()
 
-    # Create server on localhost:1502
+    # Create real Modbus TCP server on port 1502
     server = ModbusTcpServer(
         context=context,
         identity=identity,
@@ -169,7 +170,7 @@ async def start_modbus_server_async():
 
     logger.info("[+] Internal Pymodbus running on 1502")
 
-    # Start external wrapper (port 502)
+    # Start wrapper on port 502
     threading.Thread(target=tcp_logger_and_forward, daemon=True).start()
 
     await server.serve_forever()
