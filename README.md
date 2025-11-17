@@ -96,7 +96,6 @@ docker logs -f <container>
 ## 🛡 Security Notes
 
 This honeypot:
-- **Should never be deployed inside production networks**
 - Logs all activity clearly
 - Does NOT execute arbitrary writes (safe)
 
